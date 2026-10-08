@@ -4,10 +4,8 @@
     "type": "module",
     "private": true,
     "workspaces": [
-        "worker",
         "db",
-        "server",
-        "ws"
+        "server"
     ],
     "devDependencies": {
         "@types/bun": "latest"

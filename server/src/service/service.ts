@@ -1,7 +1,21 @@
 import { Repository } from "../repository/repository";
 import { Prisma } from "@workspace/db/generated/prisma/client";
+import type { Order } from "@workspace/db/generated/prisma/client";
 
 export class Service {
+    private readonly illegalTransition = {
+        "ORDERED": [],
+        "PICKUP_REJECTED": ["PICKUP_ACCEPTED", "ORDER_DELIVERING", "ORDER_DELIVERED", "ORDER_HANDLED"],
+        "PICKUP_ACCEPTED": ["PICKUP_REJECTED", "CANCELLED", "ORDER_REJECTED", "ORDER_HANDLED", "ORDER_DELIVERING", "ORDER_DELIVERED", "ORDER_PREPARING", "ORDER_PREPARED"],
+        "CANCELLED": ["ORDER_PREPARING", "ORDER_HANDLED", "ORDER_PREPARED", "PICKUP_ACCEPTED", "ORDER_DELIVERED", "ORDER_DELIVERING", "PICKUP_REJECTED", "ORDER_ACCEPTED"],
+        "ORDER_ACCEPTED": ["CANCELLED", "ORDER_HANDLED", "ORDER_REJECTED", "ORDER_PREPARING", "ORDER_PREPARED", "PICKUP_REJECTED", "PICKUP_ACCEPTED", "ORDER_DELIVERING", "ORDER_DELIVERED"],
+        "ORDER_REJECTED": ["ORDER_PREPARED", "ORDER_PREPARING", "PICKUP_ACCEPTED", "ORDER_HANDLED", "ORDER_DELIVERING", "ORDER_DELIVERED"],
+        "ORDER_PREPARING": ["ORDER_DELIVERED", "ORDER_DELIVERING", "CANCELLED", "ORDER_HANDLED"],
+        "ORDER_PREPARED": ["CANCELLED", "ORDER_ACCEPTED", "ORDER_REJECTED", "ORDER_PREPARING", "ORDER_DELIVERING", "ORDER_DELIVERED"],
+        "ORDER_HANDLED": ["CANCELLED", "ORDER_ACCEPTED", "ORDER_REJECTED", "ORDER_PREPARING", "ORDER_PREPARED", "ORDER_DELIVERED", "PICKUP_REJECTED"],
+        "ORDER_DELIVERING": ["CANCELLED", "ORDER_ACCEPTED", "ORDER_REJECTED", "ORDER_PREPARING", "ORDER_PREPARED", "ORDER_HANDLED", "PICKUP_REJECTED"],
+        "ORDER_DELIVERED": ["CANCELLED", "ORDER_ACCEPTED", "ORDER_REJECTED", "ORDER_PREPARING", "ORDER_PREPARED", "ORDER_DELIVERING", "ORDER_HANDLED", "PICKUP_REJECTED"]
+    }
     private readonly repo: Repository
 
     constructor(repository: Repository) {
@@ -10,215 +24,120 @@ export class Service {
 
     public async createOrder(userId: string, name: string) {
 
-        const item = await this.repo.client.item.findFirst({
-            where: {
-                name: name
+        const createdOrder = await this.transaction(async (tx): Promise<Order> => {
+
+            const item = await this.repo.findItem(tx, name);
+
+            if (!item) {
+                throw Error("Unable to find item")
             }
+
+            const order = await this.repo.createOrder(tx, userId, item.restaurantId, item.id);
+
+            if (!order) {
+                throw Error("Unable to create order");
+            }
+
+            return order;
         })
 
-        if (!item) {
-            throw Error("Unable to find item")
+        return createdOrder;
+    }
+
+    public async viewPendingOrder(restaurantId: string) {
+        const orders = await this.repo.viewArrivedOrder(restaurantId);
+
+        if (orders.length <= 0) {
+            throw Error("No order at this time")
         }
 
-        const order = await this.repo.client.order.create({
-            data: {
-                userId: userId,
-                restaurantId: item.restaurantId,
-                itemId: item.id
+        return orders;
+    }
+
+    public async transition(orderId: string, restaurantId: string, nextAction: keyof typeof this.illegalTransition) {
+
+        const isSuccess = await this.transaction(async (tx): Promise<Boolean> => {
+
+            const orderStatus = await this.repo.getStatus(tx, orderId, restaurantId)
+
+            if (!orderStatus) {
+                throw Error("Unable to find order with this id")
             }
+
+            const flag = this.isLegal(nextAction, orderStatus)
+
+            if (flag) {
+                throw Error("Illegal transition")
+            }
+
+            const order = await this.repo.updateStatus(tx, orderId, restaurantId, orderStatus.status, nextAction);
+
+            if (!order) {
+                throw Error("Unable to update order at this time")
+            }
+
+            return true;
         })
 
-        if (!order) {
-            throw Error("Unable to create order")
-        }
-
-        return order;
+        return isSuccess;
     }
 
-    public async viewPendingOrder(orderId: string, restaurantId: string) {
-        const orders = await this.repo.client.$queryRaw`
-            SELECT * FROM Order
-            WHERE 
-            orderId = ${orderId}
-            AND restaurantId = ${restaurantId}
-            AND isAccepted = FALSE
-            AND isRejected = FALSE
-            AND isPrepared = FALSE
-            AND isHAndled = FALSE
-            AND createdAt <= NOW() - INTERVAL '2 minutes'
-            RETURNING *;
-        `;
-    }
+    public async acceptPickup(orderId: string, restaurantId: string, deliveryAgentUserId: string) {
 
-    public async acceptOrder(orderId: string, restaurantId: string) {
-        const updateOrder = await this.repo.client.$queryRaw`
-            UPDATE Order
-                SET isAccepted = TRUE
-            WHERE
-            orderId = ${orderId}
-            AND restaurantId = ${restaurantId}
-            AND isPrepared = FALSE
-            AND isHandled = FALSE
-            AND isRejected = FALSE
-            AND createdAt <= NOW() - INTERVAL '2 minutes'
-            RETURNING *;
-        `;
+        const pickupAccepted = await this.transaction(async (tx): Promise<Boolean> => {
+            const action = "PICKUP_ACCEPTED"
+            const [orderStatus, deliveryOrder] = await Promise.all([
 
-        if (!updateOrder) throw Error(`Unable to find order with this ID ${orderId}`)
+                this.repo.getStatus(tx, orderId, restaurantId),
 
-        return updateOrder;
-    }
+                tx.deliveryOrder.findFirst({
+                    where: {
+                        orderId: orderId
+                    }
+                })
+            ])
 
-    public async rejectOrder(orderId: string, restaurantId: string) {
-
-        const updateOrder = await this.repo.client.order.update({
-            where: {
-                id: orderId,
-                restaurantId: restaurantId,
-                isPrepared: {
-                    not: true
-                },
-                isHandled: {
-                    not: true
-                }
-            },
-            data: {
-                isRejected: true,
+            if (!orderStatus || deliveryOrder) {
+                throw Error("Unable to update this order")
             }
-        })
 
-        if (!updateOrder) throw Error(`Unable to find order with this ID ${orderId}`)
+            const isIllegal = this.isLegal(action, orderStatus)
 
-        return updateOrder;
-    }
+            if (isIllegal) {
+                throw Error("Invalid transition")
 
-    public async acceptPickup(orderId: string, deliveryAgentUserId: string) {
+            }
 
-        const [order, deliveryOrder] = await Promise.all([
-
-            await this.repo.client.order.findFirst({
-                where: {
-                    id: orderId,
-                    isAccepted: true,
-                    isHandled: false
-                }
-            }),
-
-            await this.repo.client.deliveryOrder.findFirst({
-                where: {
-                    orderId: orderId
+            await tx.deliveryOrder.create({
+                data: {
+                    orderId: orderId,
+                    deliveryAgentId: deliveryAgentUserId,
                 }
             })
-        ])
 
+            const order = await this.repo.updateStatus(tx, orderId, restaurantId, orderStatus.status, action);
 
-        if (!order || deliveryOrder) {
-            throw Error("Unable to update this order")
-        }
-
-        const createDelivery = await this.repo.client.deliveryOrder.create({
-            data: {
-                orderId: orderId,
-                deliveryAgentId: deliveryAgentUserId,
-                isAccepted: true,
+            if (!order) {
+                throw Error("Unable to accept pickup at this time")
             }
+
+            return true;
         })
 
-        return createDelivery;
+        return pickupAccepted;
     }
 
-    public async markPrepared(orderId: string) {
-        const order = await this.repo.client.order.update({
-            where: {
-                id: orderId,
-                isPrepared: false,
-                isAccepted: true,
-                isHandled: false,
-            },
-            data: {
-                isPrepared: true
+    private isLegal(action: keyof typeof this.illegalTransition, order: { status: string }) {
+        let flag = false;
+
+        this.illegalTransition[action].forEach((idx) => {
+            if (order.status === idx) {
+                flag = true
+                return
             }
-        })
+        });
 
-        if (!order) {
-            throw Error("Unable to mark prepared at this time")
-        }
-
-        return order;
-    }
-
-    public async markHandled(orderId: string) {
-        const order = await this.repo.client.order.update({
-            where: {
-                id: orderId,
-                isAccepted: true,
-                isPrepared: true,
-                isRejected: false,
-                isHandled: false
-            },
-            data: {
-                isHandled: true
-            }
-        })
-
-        if (!order) { throw Error("Unable to mark handled at this time") }
-
-        return order;
-    }
-
-    public async markPicked(orderId: string, deliveryAgentId: string, restaurantId: string) {
-
-        const deliveryOrder = await this.repo.client.$queryRaw`
-            UPDATE DeliveryOrder
-                SET isPicked = TRUE
-            WHERE 
-                orderId = ${orderId} 
-                AND deliveryAgentId = ${deliveryAgentId} 
-                AND isAccepted = TRUE 
-                AND isPicked = FALSE 
-                AND isDelivered = FALSE
-            RETURNING *;
-        `
-
-        if (!deliveryOrder) {
-            throw Error("Unable to make picked at this time")
-        }
-
-        return deliveryOrder;
-    }
-
-    public async markDelivered(orderId: string, deliveryAgentId: string, userId: string) {
-        const deliveryOrder = await this.repo.client.$queryRaw`
-            UPDATE DeliveryOrder
-                SET isDelivered = TRUE
-            WHERE 
-                orderId = ${orderId}
-                AND deliverAgentId = ${deliveryAgentId}
-                AND isAccepted = TRUE
-                AND isPicked = TRUE
-            RETURNING *;
-        `
-
-        if (!deliveryOrder) {
-            throw Error("Unable to mark delivered at this time")
-        }
-
-        return deliveryOrder;
-    }
-
-    public async rejectPickup(orderId: string, deliveryAgentId: string) {
-        const deliveryOrder = await this.repo.client.deliveryOrder.create({
-            data: {
-                orderId: orderId,
-                deliveryAgentId: deliveryAgentId
-            }
-        })
-
-        if (!deliveryOrder) {
-            throw Error("Unable to reject order at this time")
-        }
-
-        return deliveryOrder;
+        return flag;
     }
 
     private async transaction<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {

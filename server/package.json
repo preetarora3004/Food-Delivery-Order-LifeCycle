@@ -10,12 +10,14 @@
         "@types/bun": "latest",
         "@types/dotenv": "^8.2.3",
         "@types/express": "^5.0.6",
+        "@types/jsonwebtoken": "^9.0.10",
         "@types/ws": "^8.18.2"
     },
     "peerDependencies": {
         "typescript": "^5"
     },
     "dependencies": {
+        "jsonwebtoken": "^9.0.3",
         "@workspace/db": "workspace:*",
         "dotenv": "^18.0.5",
         "express": "^5.2.1",

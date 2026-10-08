@@ -7,6 +7,20 @@ datasource db {
     provider = "postgresql"
 }
 
+enum Status {
+    ORDERED
+    CANCELLED
+    ORDER_ACCEPTED
+    ORDER_REJECTED
+    ORDER_PREPARING
+    ORDER_PREPARED
+    ORDER_HANDLED
+    PICKUP_ACCEPTED
+    PICKUP_REJECTED
+    ORDER_DELIVERING
+    ORDER_DELIVERED
+}
+
 model User {
     id       String @id @default(cuid())
     username String
@@ -57,10 +71,7 @@ model Item {
 model Order {
     id String @id @default(cuid())
 
-    isAccepted Boolean @default(false)
-    isPrepared Boolean @default(false)
-    isHandled  Boolean @default(false)
-    isRejected Boolean @default(false)
+    status Status
 
     restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
     restaurantId String
@@ -84,10 +95,6 @@ model DeliveryOrder {
 
     order   Order  @relation(fields: [orderId], references: [id])
     orderId String
-
-    isAccepted  Boolean @default(false)
-    isPicked    Boolean @default(false)
-    isDelivered Boolean @default(false)
 
     deliveryAgent   DeliveryAgent @relation(fields: [deliveryAgentId], references: [id])
     deliveryAgentId String
